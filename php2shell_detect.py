@@ -33,11 +33,12 @@ import json
 import os
 import re
 import sys
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 
 @dataclass
@@ -195,12 +196,295 @@ def extract_phpsessid(cookie_str):
     return m.group(1) if m else None
 
 
+# ---------------------------------------------------------------------------
+# LFI and PoC-marker evidence (P2S-017 to P2S-021)
+# ---------------------------------------------------------------------------
+
+# sess_<id> file reference in a request path or query string
+SESSION_FILE_RE = re.compile(
+    r'(?i)(?:^|[/\\])sess_([A-Za-z0-9,-]{4,128})(?:$|[^A-Za-z0-9,-])'
+)
+PROGRESS_RE = re.compile(r'(?i)PHP_SESSION_UPLOAD_PROGRESS')
+PHP_CODE_RE = re.compile(
+    r'(?i)<\?(?:php|=)|'
+    r'\b(?:system|exec|passthru|shell_exec|eval)\s*\(\s*'
+    r'(?:base64_decode\s*\()?'
+)
+POC_MARKER_RE = re.compile(
+    r'(?i)----php2shell[0-9a-f]{16}|'
+    r'PHP2SHELL_PROBE_[a-z0-9]+|'
+    r'php2shell-fixation-probe'
+)
+SESSION_DECODE_RE = re.compile(
+    r'(?i)Failed\s+to\s+decode\s+session\s+object|'
+    r'Session\s+object\s+destruction\s+failed|'
+    r'Failed\s+to\s+decode\s+session\s+data'
+)
+
+
+def decode_visible(value):
+    """URL-decode text already present in a log (two passes, bounded length)."""
+    result = value[:65536]
+    for _ in range(2):
+        decoded = unquote(result)
+        if decoded == result:
+            break
+        result = decoded
+    return result
+
+
+def parse_access_time(value):
+    """Parse Apache/Nginx access timestamps; anything else gives None."""
+    try:
+        return datetime.strptime(value, "%d/%b/%Y:%H:%M:%S %z").astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass
+class AccessEvent:
+    """Access-log facts kept for time-bounded P2S-021 correlation."""
+    machine: str
+    file_path: str
+    line_number: int
+    raw_line: str
+    source_ip: str
+    endpoint: str
+    method: str
+    status: int
+    timestamp: str
+    when: Optional[datetime]
+    session_id: Optional[str]
+    is_upload: bool
+    session_file_id: Optional[str]
+    is_php: bool = False
+
+
+def build_access_event(parsed, raw_line, line_num, filepath, machine):
+    if not parsed:
+        return None
+    method = parsed.get("method", "") or ""
+    path = parsed.get("path", "") or ""
+    timestamp = parsed.get("timestamp", "") or ""
+    visible_line = decode_visible(raw_line)
+    sess_match = SESSION_FILE_RE.search(decode_visible(path))
+    is_upload = method.upper() == "POST" and bool(
+        PROGRESS_RE.search(visible_line) or "multipart" in visible_line.lower()
+    )
+    return AccessEvent(
+        machine=machine,
+        file_path=filepath,
+        line_number=line_num,
+        raw_line=raw_line,
+        source_ip=parsed.get("ip", "") or "",
+        endpoint=path,
+        method=method,
+        status=parsed.get("status", 0),
+        timestamp=timestamp,
+        when=parse_access_time(timestamp),
+        session_id=extract_phpsessid(parsed.get("cookie", "") or ""),
+        is_upload=is_upload,
+        session_file_id=sess_match.group(1) if sess_match else None,
+        is_php=bool(re.search(r'\.php', path.split("?", 1)[0], re.IGNORECASE)),
+    )
+
+
+def parse_error_time(value):
+    """Apache error timestamps have no UTC offset; they are compared as UTC."""
+    for fmt in ("%a %b %d %H:%M:%S.%f %Y", "%a %b %d %H:%M:%S %Y"):
+        try:
+            return datetime.strptime(value, fmt)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def finding_time(finding):
+    """Naive UTC time of a finding, from an access or error timestamp."""
+    parsed = parse_access_time(finding.timestamp or "")
+    if parsed:
+        return parsed.replace(tzinfo=None)
+    return parse_error_time(finding.timestamp or "")
+
+
+BURST_CRASH_RULES = ("P2S-004", "P2S-006", "P2S-009", "P2S-011")
+BURST_LFI_RULES = ("P2S-018", "P2S-021")
+
+
+def burst_trigger(event):
+    """Return the trigger an access event carries, or None."""
+    visible = decode_visible(event.raw_line)
+    if PROGRESS_RE.search(visible):
+        return "upload-progress field"
+    if POC_MARKER_RE.search(visible):
+        return "PoC marker"
+    if "multipart" in visible.lower() and event.status >= 500:
+        return "multipart POST with HTTP 5xx"
+    return None
+
+
+def detect_post_bursts(events, findings, window_seconds=20, threshold=4):
+    """Rapid PHP POST bursts from one client, reported only with a trigger.
+
+    A burst is `threshold` PHP POSTs from the same machine and source IP
+    within `window_seconds`, with at least one trigger in that window
+    (upload-progress field, PoC marker, or multipart POST answered with 5xx).
+    Severity is HIGH when the same client also has a crash/OOM finding or an
+    LFI session-file finding within the window. One finding per burst.
+    """
+    window = timedelta(seconds=window_seconds)
+    groups = defaultdict(list)
+    for event in events:
+        if (event.when and event.is_php and event.source_ip
+                and event.method.upper() == "POST"):
+            groups[(event.machine, event.source_ip)].append(event)
+
+    evidence = defaultdict(list)
+    for finding in findings:
+        if finding.source_ip and finding.rule_id in BURST_CRASH_RULES + BURST_LFI_RULES:
+            evidence[finding.source_ip].append(finding)
+
+    results = []
+    for (machine, ip), group in groups.items():
+        group.sort(key=lambda event: event.when)
+        recent = deque()
+        last_report = None
+        for event in group:
+            while recent and event.when - recent[0].when > window:
+                recent.popleft()
+            recent.append(event)
+            if len(recent) < threshold:
+                continue
+            if last_report and event.when - last_report <= window:
+                continue
+            triggers = sorted({t for t in (burst_trigger(e) for e in recent) if t})
+            if not triggers:
+                continue
+
+            start = recent[0].when.replace(tzinfo=None)
+            end = event.when.replace(tzinfo=None)
+            correlated = []
+            for finding in evidence.get(ip, []):
+                t = finding_time(finding)
+                if finding.machine == machine and t and start - window <= t <= end + window:
+                    correlated.append(finding.rule_id)
+            correlated = sorted(set(correlated))
+
+            last_report = event.when
+            description = (f"{len(recent)} PHP POSTs from one client within "
+                           f"{window_seconds}s with trigger: {', '.join(triggers)}")
+            if correlated:
+                description += "; correlated with " + ", ".join(correlated)
+            results.append(Finding(
+                rule_id="P2S-013",
+                severity="HIGH" if correlated else "MEDIUM",
+                cve="CVE-2026-109618 / CVE-2026-109619",
+                machine=machine, file_path=event.file_path,
+                line_number=event.line_number, raw_line=event.raw_line,
+                description=description,
+                source_ip=ip, endpoint=event.endpoint, http_method="POST",
+                http_status=event.status, timestamp=event.timestamp,
+                session_id=event.session_id,
+                extra={
+                    "post_count": len(recent),
+                    "window_seconds": window_seconds,
+                    "triggers": triggers,
+                    "correlated_rules": correlated,
+                },
+            ))
+    return results
+
+
+def correlate_session_evidence(findings, events, window_seconds=120):
+    """Add P2S-021 (upload then sess_<id> request) and LFI-chain elevation.
+
+    Matching needs the same machine, source IP and observed session ID, with
+    a forward interval. Without parseable timestamps nothing is asserted.
+    """
+    by_key = defaultdict(list)
+    for event in events:
+        if event.when and event.is_upload and event.session_id:
+            by_key[(event.machine, event.source_ip, event.session_id)].append(event)
+    for uploads in by_key.values():
+        uploads.sort(key=lambda event: event.when)
+
+    existing = {(f.rule_id, f.file_path, f.line_number) for f in findings}
+    for event in events:
+        if not (event.when and event.session_file_id):
+            continue
+        candidates = by_key.get(
+            (event.machine, event.source_ip, event.session_file_id), []
+        )
+        matched = next(
+            (
+                upload for upload in reversed(candidates)
+                if timedelta(0) <= event.when - upload.when
+                <= timedelta(seconds=window_seconds)
+            ),
+            None,
+        )
+        if not matched:
+            continue
+        identity = ("P2S-021", event.file_path, event.line_number)
+        if identity in existing:
+            continue
+        existing.add(identity)
+        findings.append(Finding(
+            rule_id="P2S-021", severity="HIGH",
+            cve="CVE-2026-109618 / CVE-2026-109619",
+            machine=event.machine, file_path=event.file_path,
+            line_number=event.line_number, raw_line=event.raw_line,
+            description=("Logged upload was followed by a request referencing the "
+                         "same session file from the same client; investigate whether "
+                         "the application included or merely read the file"),
+            source_ip=event.source_ip, endpoint=event.endpoint,
+            http_method=event.method, http_status=event.status,
+            timestamp=event.timestamp, session_id=event.session_file_id,
+            extra={
+                "upload_file": matched.file_path,
+                "upload_line": matched.line_number,
+                "seconds_after_upload": round(
+                    (event.when - matched.when).total_seconds(), 3
+                ),
+            },
+        ))
+
+    # Same logged line shows the PoC marker AND an upload-progress field:
+    # elevate P2S-017 to CRITICAL (still attempt evidence, not proof of RCE).
+    by_line = defaultdict(set)
+    for f in findings:
+        by_line[(f.file_path, f.line_number)].add(f.rule_id)
+    for f in findings:
+        if f.rule_id == "P2S-017" and {"P2S-010", "P2S-017"} <= by_line[(f.file_path, f.line_number)]:
+            f.severity = "CRITICAL"
+            f.extra["correlation"] = "PoC marker and upload-progress field in one logged request"
+
+
 SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
 
 
 # ---------------------------------------------------------------------------
 # Detection rules — Access logs
 # ---------------------------------------------------------------------------
+
+# Query keys that commonly feed include/require sinks (LFI candidates)
+INCLUDE_PARAMS = (
+    "page", "file", "path", "doc", "document", "include",
+    "inc", "view", "lang", "template", "page_id", "f",
+)
+
+
+def include_param_for_session(path):
+    """Return the include-like query key whose value references a sess_<id>."""
+    try:
+        pairs = parse_qsl(urlsplit(path).query, keep_blank_values=True, max_num_fields=64)
+    except ValueError:
+        return None
+    for key, value in pairs:
+        if key.lower() in INCLUDE_PARAMS and SESSION_FILE_RE.search(decode_visible(value)):
+            return key
+    return None
+
 
 def check_access_rules(parsed, raw_line, line_num, filepath, machine):
     findings = []
@@ -278,6 +562,54 @@ def check_access_rules(parsed, raw_line, line_num, filepath, machine):
                 http_status=status, timestamp=timestamp, session_id=session_id,
                 extra={"bytes_in": bytes_in},
             ))
+
+    # P2S-017: Distinctive PoC boundary or probe marker (only if logged)
+    visible_line = decode_visible(raw_line)
+    if POC_MARKER_RE.search(visible_line):
+        findings.append(Finding(
+            rule_id="P2S-017", severity="HIGH",
+            cve="CVE-2026-109618 / CVE-2026-109619",
+            machine=machine, file_path=filepath, line_number=line_num,
+            raw_line=raw_line,
+            description="Distinctive php2shell PoC boundary or probe marker is visible",
+            source_ip=ip, endpoint=path, http_method=method,
+            http_status=status, timestamp=timestamp, session_id=session_id,
+        ))
+
+    # P2S-019: PHP code near a logged upload-progress field (same line only)
+    progress_match = PROGRESS_RE.search(visible_line)
+    if progress_match and PHP_CODE_RE.search(visible_line[progress_match.end():][:1024]):
+        findings.append(Finding(
+            rule_id="P2S-019", severity="HIGH",
+            cve="CVE-2026-109618 / CVE-2026-109619",
+            machine=machine, file_path=filepath, line_number=line_num,
+            raw_line=raw_line,
+            description="PHP code appears near the logged upload-progress field; inspect the original request/body evidence",
+            source_ip=ip, endpoint=path, http_method=method,
+            http_status=status, timestamp=timestamp, session_id=session_id,
+        ))
+
+    # P2S-018: Request path references a PHP session file (sess_<id>).
+    # HIGH when the reference sits under an include-like query key; the log
+    # still does not prove that the file was included.
+    sess_ref = SESSION_FILE_RE.search(decode_visible(path))
+    if sess_ref:
+        include_key = include_param_for_session(path)
+        findings.append(Finding(
+            rule_id="P2S-018", severity="HIGH" if include_key else "MEDIUM",
+            cve="CVE-2026-109618 / CVE-2026-109619",
+            machine=machine, file_path=filepath, line_number=line_num,
+            raw_line=raw_line,
+            description=(
+                f"Include-like parameter '{include_key}' references a PHP session file; "
+                "the log does not prove that the file was included"
+                if include_key else
+                "HTTP request references a PHP sess_<id> file; possible file-read or inclusion probe"
+            ),
+            source_ip=ip, endpoint=path, http_method=method,
+            http_status=status, timestamp=timestamp, session_id=session_id,
+            extra={"referenced_session_id": sess_ref.group(1), "include_param": include_key},
+        ))
 
     # P2S-013: Rapid POST burst from same IP (FIRE phase: multiple spray requests)
     # Tracked via post_tracker in scan_file, evaluated in correlate_findings
@@ -408,6 +740,17 @@ def check_error_rules(parsed, raw_line, line_num, filepath, machine):
             machine=machine, file_path=filepath, line_number=line_num,
             raw_line=raw_line,
             description="Stale session state detected — bailout leaked PS(session_status)=active across requests",
+            source_ip=client_ip, timestamp=timestamp,
+        ))
+
+    # P2S-020: Session decode/deserialization error
+    if SESSION_DECODE_RE.search(msg):
+        findings.append(Finding(
+            rule_id="P2S-020", severity="MEDIUM",
+            cve="CVE-2026-109618 / CVE-2026-109619",
+            machine=machine, file_path=filepath, line_number=line_num,
+            raw_line=raw_line,
+            description="Session decode/deserialization error; investigate possible serializer mismatch and application configuration",
             source_ip=client_ip, timestamp=timestamp,
         ))
 
@@ -548,7 +891,7 @@ def correlate_findings(findings):
 # Scanner
 # ---------------------------------------------------------------------------
 
-def scan_file(filepath, log_root, verbose=False):
+def scan_file(filepath, log_root, verbose=False, events=None):
     findings = []
     machine = extract_machine_name(filepath, log_root)
 
@@ -580,6 +923,10 @@ def scan_file(filepath, log_root, verbose=False):
                 if log_type in (LogType.APACHE_ACCESS, LogType.NGINX_ACCESS):
                     parsed = parse_access_line(line)
                     findings.extend(check_access_rules(parsed, line, line_num, filepath, machine))
+                    if events is not None:
+                        event = build_access_event(parsed, line, line_num, filepath, machine)
+                        if event:
+                            events.append(event)
                 elif log_type == LogType.APACHE_ERROR:
                     parsed = parse_error_line(line)
                     findings.extend(check_error_rules(parsed, line, line_num, filepath, machine))
@@ -598,7 +945,7 @@ def scan_file(filepath, log_root, verbose=False):
     return findings, log_type
 
 
-def scan_directory(log_root, verbose=False):
+def scan_directory(log_root, verbose=False, events=None):
     all_findings = []
     file_count = 0
     type_counts = defaultdict(int)
@@ -629,7 +976,7 @@ def scan_directory(log_root, verbose=False):
                 continue
 
             file_count += 1
-            findings, log_type = scan_file(filepath, log_root, verbose)
+            findings, log_type = scan_file(filepath, log_root, verbose, events)
             type_counts[log_type] += 1
             all_findings.extend(findings)
 
@@ -672,9 +1019,15 @@ RULE_DESCRIPTIONS = {
     "P2S-010": "PHP_SESSION_UPLOAD_PROGRESS in request",
     "P2S-011": "Pre-RINIT OOM ('in Unknown on line 0') — SMOKING GUN",
     "P2S-012": "Invalid session ID probe",
+    "P2S-013": "Rapid PHP POST burst with a trigger, correlated when possible",
     "P2S-014": "Session data read/write failure",
     "P2S-015": "Oversized POST rejected (ARM attempt blocked)",
     "P2S-016": "Stale session state (bailout leak)",
+    "P2S-017": "php2shell PoC boundary or probe marker visible",
+    "P2S-018": "PHP sess_<id> file referenced in a request",
+    "P2S-019": "PHP code near an upload-progress field",
+    "P2S-020": "Session decode/deserialization error",
+    "P2S-021": "Upload followed by a request for the same session file",
 }
 
 
@@ -807,7 +1160,7 @@ def main():
         description="PHP2SHELL Log Detector v2.0 (CVE-2026-109618 & CVE-2026-109619)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Rules (16 detection patterns):
+Rules (20 detection patterns):
   P2S-001  Large POST to PHP endpoint (ARM payload)           MEDIUM/HIGH
   P2S-002  HTTP 500 after POST to PHP                         HIGH
   P2S-003  PHP memory exhaustion                              HIGH
@@ -819,9 +1172,15 @@ Rules (16 detection patterns):
   P2S-010  PHP_SESSION_UPLOAD_PROGRESS in request             CRITICAL
   P2S-011  Pre-RINIT OOM ("in Unknown on line 0")             CRITICAL
   P2S-012  Invalid session ID probe                           MEDIUM/HIGH
+  P2S-013  Rapid PHP POST burst (trigger + threshold)         MEDIUM/HIGH
   P2S-014  Session data read/write failure                    MEDIUM
   P2S-015  Oversized POST rejected                            MEDIUM
   P2S-016  Stale session state (bailout leak)                 HIGH
+  P2S-017  php2shell PoC boundary or probe marker visible      HIGH
+  P2S-018  PHP sess_<id> file referenced in a request          MEDIUM
+  P2S-019  PHP code near an upload-progress field              HIGH
+  P2S-020  Session decode/deserialization error                MEDIUM
+  P2S-021  Upload followed by a request for the same session fileHIGH
 
 Examples:
   %(prog)s /var/log/
@@ -836,11 +1195,17 @@ Examples:
                         help="Export findings to CSV file")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Show detailed scan progress")
+    parser.add_argument("--burst-window", type=int, default=20, metavar="SECONDS",
+                        help="Window for POST-burst detection (default: 20)")
+    parser.add_argument("--burst-threshold", type=int, default=4, metavar="N",
+                        help="Minimum PHP POSTs in a burst (default: 4)")
     parser.add_argument("--min-severity",
                         choices=["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"],
                         default="LOW",
                         help="Minimum severity to report (default: LOW)")
     args = parser.parse_args()
+    if args.burst_window < 1 or args.burst_threshold < 2:
+        parser.error("--burst-window must be >= 1 and --burst-threshold >= 2")
 
     log_dir = os.path.abspath(args.log_dir)
     if not os.path.isdir(log_dir):
@@ -849,9 +1214,14 @@ Examples:
 
     print(f"[*] Scanning: {log_dir}")
 
-    all_findings, file_count, type_counts = scan_directory(log_dir, args.verbose)
+    events = []
+    all_findings, file_count, type_counts = scan_directory(log_dir, args.verbose, events)
     all_findings = deduplicate_findings(all_findings)
     correlate_findings(all_findings)
+    correlate_session_evidence(all_findings, events)
+    all_findings.extend(detect_post_bursts(
+        events, all_findings, args.burst_window, args.burst_threshold,
+    ))
 
     min_sev = SEVERITY_ORDER.get(args.min_severity, 3)
     filtered = [f for f in all_findings if SEVERITY_ORDER.get(f.severity, 99) <= min_sev]
